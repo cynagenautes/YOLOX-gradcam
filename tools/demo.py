@@ -10,11 +10,13 @@ from loguru import logger
 import cv2
 
 import torch
+from torchinfo import summary
 
 from yolox.data.data_augment import ValTransform
 from yolox.data.datasets import COCO_CLASSES
 from yolox.exp import get_exp
 from yolox.utils import fuse_model, get_model_info, postprocess, vis
+from yolox.utils.gradcam import GradCAM, apply_gradcam
 
 IMAGE_EXT = [".jpg", ".jpeg", ".webp", ".bmp", ".png"]
 
@@ -83,6 +85,19 @@ def make_parser():
         action="store_true",
         help="Using TensorRT model for testing.",
     )
+    # Grad-CAM関連の引数を追加
+    parser.add_argument(
+        "--gradcam",
+        default=False,
+        action="store_true",
+        help="Enable Grad-CAM visualization",
+    )
+    parser.add_argument(
+        "--target-layer",
+        type=str,
+        default="backbone.backbone.dark5.2.conv1",
+        help="Target layer for Grad-CAM visualization",
+    )
     return parser
 
 
@@ -108,6 +123,8 @@ class Predictor(object):
         device="cpu",
         fp16=False,
         legacy=False,
+        use_gradcam=False,
+        target_layer=None,
     ):
         self.model = model
         self.cls_names = cls_names
@@ -119,6 +136,15 @@ class Predictor(object):
         self.device = device
         self.fp16 = fp16
         self.preproc = ValTransform(legacy=legacy)
+        
+        # Grad-CAM関連
+        self.use_gradcam = use_gradcam
+        self.target_layer = target_layer
+        self.gradcam = None
+        
+        if use_gradcam and target_layer is not None:
+            self.gradcam = GradCAM(model, target_layer)
+        
         if trt_file is not None:
             from torch2trt import TRTModule
 
@@ -153,34 +179,73 @@ class Predictor(object):
             if self.fp16:
                 img = img.half()  # to FP16
 
-        with torch.no_grad():
-            t0 = time.time()
-            outputs = self.model(img)
-            if self.decoder is not None:
-                outputs = self.decoder(outputs, dtype=outputs.type())
-            outputs = postprocess(
-                outputs, self.num_classes, self.confthre,
-                self.nmsthre, class_agnostic=True
-            )
-            logger.info("Infer time: {:.4f}s".format(time.time() - t0))
+        if self.use_gradcam:
+            # Grad-CAM用に勾配を有効化
+            with torch.set_grad_enabled(True):
+                outputs = self.model(img)
+                if self.decoder is not None:
+                    outputs = self.decoder(outputs, dtype=outputs.type())
+                outputs = postprocess(
+                    outputs, self.num_classes, self.confthre,
+                    self.nmsthre, class_agnostic=True
+                )
+                # Grad-CAMを計算するために入力と出力を保存
+                self.last_input = img
+                self.last_outputs = outputs
+        else:
+            with torch.no_grad():
+                t0 = time.time()
+                outputs = self.model(img)
+                if self.decoder is not None:
+                    outputs = self.decoder(outputs, dtype=outputs.type())
+                outputs = postprocess(
+                    outputs, self.num_classes, self.confthre,
+                    self.nmsthre, class_agnostic=True
+                )
+                logger.info("Infer time: {:.4f}s".format(time.time() - t0))
+        
         return outputs, img_info
 
+    # 複数オブジェクトへのGrad-CAM適用（スコア上位N個）
     def visual(self, output, img_info, cls_conf=0.35):
         ratio = img_info["ratio"]
         img = img_info["raw_img"]
+        
         if output is None:
             return img
+            
         output = output.cpu()
-
         bboxes = output[:, 0:4]
-
-        # preprocessing: resize
         bboxes /= ratio
-
         cls = output[:, 6]
         scores = output[:, 4] * output[:, 5]
-
+        
+        # 通常の可視化
         vis_res = vis(img, bboxes, scores, cls, cls_conf, self.cls_names)
+        
+        # Grad-CAM可視化（上位N個のオブジェクトに適用する場合）
+        if self.use_gradcam and len(scores) > 0 and self.gradcam is not None:
+            # スコア順にソート
+            sorted_indices = torch.argsort(scores, descending=True)
+            
+            # 上位N個（例：3個）までを処理
+            max_objects = min(10, len(sorted_indices))
+            
+            for i in range(max_objects):
+                idx = sorted_indices[i]
+                if scores[idx] < cls_conf:
+                    continue  # 閾値以下のスコアは処理しない
+                    
+                class_idx = int(cls[idx].item())
+                
+                # Grad-CAMを計算
+                cam = self.gradcam(self.last_input, class_idx=class_idx, box_idx=idx)
+                
+                if cam is not None:
+                    bbox = bboxes[idx].tolist()
+                    
+                    # ヒートマップを適用（バウンディングボックス内のみ）
+                    vis_res = apply_gradcam(vis_res, cam, bbox)
         return vis_res
 
 
@@ -266,6 +331,8 @@ def main(exp, args):
         exp.test_size = (args.tsize, args.tsize)
 
     model = exp.get_model()
+    summary(model, (1, 3, 416, 416), device=args.device)
+    print([name for name, _ in model.named_modules()])
     logger.info("Model Summary: {}".format(get_model_info(model, exp.test_size)))
 
     if args.device == "gpu":
@@ -305,6 +372,7 @@ def main(exp, args):
     predictor = Predictor(
         model, exp, COCO_CLASSES, trt_file, decoder,
         args.device, args.fp16, args.legacy,
+        use_gradcam=args.gradcam, target_layer=args.target_layer
     )
     current_time = time.localtime()
     if args.demo == "image":
