@@ -45,13 +45,14 @@ class GradCAM:
         for hook in self.hooks:
             hook.remove()
     
-    def __call__(self, inputs, class_idx=None, box_idx=0):
+    def __call__(self, inputs, class_idx=None, box_idx=0, img_info=None):
         """
         Grad-CAMを計算
         Args:
             inputs: モデルへの入力テンソル
             class_idx: クラスインデックス (Noneの場合は最大スコアのクラスを使用)
             box_idx: ボックスのインデックス (複数検出時)
+            img_info: 画像変換情報 (リサイズ比率など)
         Returns:
             cam: Grad-CAMヒートマップ (元の画像サイズにリサイズ済み)
         """
@@ -92,29 +93,52 @@ class GradCAM:
         # ReLUを適用
         cam = F.relu(cam)
         
-        # 正規化
+        # CAM特徴マップを入力サイズに拡大
         cam = F.interpolate(cam, size=inputs.shape[2:], mode='bilinear', align_corners=False)
+        
+        # 正規化
         cam_min, cam_max = cam.min(), cam.max()
-        cam = (cam - cam_min).div(cam_max - cam_min)
-
+        if cam_max > cam_min:
+            cam = (cam - cam_min).div(cam_max - cam_min)
+        else:
+            cam = torch.zeros_like(cam)
+        
         # numpy配列に変換
         cam = cam[0, 0].cpu().numpy()
-
+        
         return cam
 
-def apply_gradcam(img, cam, bbox=None):
+def apply_gradcam(img, cam, bbox=None, img_info=None):
     """
     Grad-CAMヒートマップを画像に適用
     Args:
         img: 元の画像 (OpenCV BGR形式)
         cam: Grad-CAMヒートマップ
         bbox: バウンディングボックス [x0, y0, x1, y1] (Noneの場合は画像全体)
+        img_info: 画像変換情報 (リサイズ比率など)
     Returns:
         視覚化された画像
     """
     height, width = img.shape[:2]
-    # ヒートマップをリサイズして画像サイズに合わせる
+    
+    # パディング情報が提供されている場合
+    if img_info is not None and "ratio" in img_info:
+        ratio = img_info["ratio"]
+        # モデル入力サイズ
+        input_h, input_w = int(height * ratio), int(width * ratio)
+        
+        # パディング量を計算
+        pad_h = img_info["test_size"][0] - input_h
+        pad_w = img_info["test_size"][1] - input_w
+        
+        # パディングを除いたCAMを取得
+        if pad_h > 0 or pad_w > 0:
+            # CAMから有効部分のみ抽出（パディング部分を除去）
+            cam = cam[:input_h, :input_w]
+    
+    # ヒートマップをリサイズして元の画像サイズに合わせる
     heatmap = cv2.resize(cam, (width, height))
+    
     # ヒートマップをカラーマップに変換
     heatmap = np.uint8(255 * heatmap)
     heatmap = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)

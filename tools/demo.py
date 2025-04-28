@@ -171,6 +171,8 @@ class Predictor(object):
         ratio = min(self.test_size[0] / img.shape[0], self.test_size[1] / img.shape[1])
         img_info["ratio"] = ratio
 
+        img_info["test_size"] = self.test_size
+
         img, _ = self.preproc(img, None, self.test_size)
         img = torch.from_numpy(img).unsqueeze(0)
         img = img.float()
@@ -237,15 +239,17 @@ class Predictor(object):
                     continue  # 閾値以下のスコアは処理しない
                     
                 class_idx = int(cls[idx].item())
+
+                img_info["test_size"] = self.test_size
                 
                 # Grad-CAMを計算
-                cam = self.gradcam(self.last_input, class_idx=class_idx, box_idx=idx)
+                cam = self.gradcam(self.last_input, class_idx=class_idx, box_idx=idx, img_info=img_info)
                 
                 if cam is not None:
                     bbox = bboxes[idx].tolist()
                     
                     # ヒートマップを適用（バウンディングボックス内のみ）
-                    vis_res = apply_gradcam(vis_res, cam, bbox)
+                    vis_res = apply_gradcam(vis_res, cam, bbox, img_info)
         return vis_res
 
 
