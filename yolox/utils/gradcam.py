@@ -75,8 +75,10 @@ class GradCAM:
             box_idx = idx
             
         # 対象のボックスとクラススコアを取得
-        target = outputs[0][box_idx, 4] * outputs[0][box_idx, 5]
-        
+        objectness = outputs[0][box_idx, 4]  # objectness score
+        class_scores = outputs[0][box_idx, class_idx+5]
+        target = objectness * class_scores
+
         # 勾配を計算
         target.backward()
         
