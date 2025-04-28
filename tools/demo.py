@@ -10,11 +10,13 @@ from loguru import logger
 import cv2
 
 import torch
+from torchinfo import summary
 
 from yolox.data.data_augment import ValTransform
 from yolox.data.datasets import COCO_CLASSES
 from yolox.exp import get_exp
 from yolox.utils import fuse_model, get_model_info, postprocess, vis
+from yolox.utils.gradcam import GradCAM, apply_gradcam
 
 IMAGE_EXT = [".jpg", ".jpeg", ".webp", ".bmp", ".png"]
 
@@ -83,6 +85,19 @@ def make_parser():
         action="store_true",
         help="Using TensorRT model for testing.",
     )
+    # Grad-CAM関連の引数を追加
+    parser.add_argument(
+        "--gradcam",
+        default=False,
+        action="store_true",
+        help="Enable Grad-CAM visualization",
+    )
+    parser.add_argument(
+        "--target-layer",
+        type=str,
+        default="backbone.backbone.dark5.2.conv1",
+        help="Target layer for Grad-CAM visualization",
+    )
     return parser
 
 
@@ -108,6 +123,8 @@ class Predictor(object):
         device="cpu",
         fp16=False,
         legacy=False,
+        use_gradcam=False,
+        target_layer=None,
     ):
         self.model = model
         self.cls_names = cls_names
@@ -119,6 +136,15 @@ class Predictor(object):
         self.device = device
         self.fp16 = fp16
         self.preproc = ValTransform(legacy=legacy)
+        
+        # Grad-CAM関連
+        self.use_gradcam = use_gradcam
+        self.target_layer = target_layer
+        self.gradcam = None
+        
+        if use_gradcam and target_layer is not None:
+            self.gradcam = GradCAM(model, target_layer)
+        
         if trt_file is not None:
             from torch2trt import TRTModule
 
@@ -145,6 +171,8 @@ class Predictor(object):
         ratio = min(self.test_size[0] / img.shape[0], self.test_size[1] / img.shape[1])
         img_info["ratio"] = ratio
 
+        img_info["test_size"] = self.test_size
+
         img, _ = self.preproc(img, None, self.test_size)
         img = torch.from_numpy(img).unsqueeze(0)
         img = img.float()
@@ -153,35 +181,109 @@ class Predictor(object):
             if self.fp16:
                 img = img.half()  # to FP16
 
-        with torch.no_grad():
-            t0 = time.time()
-            outputs = self.model(img)
-            if self.decoder is not None:
-                outputs = self.decoder(outputs, dtype=outputs.type())
-            outputs = postprocess(
-                outputs, self.num_classes, self.confthre,
-                self.nmsthre, class_agnostic=True
-            )
-            logger.info("Infer time: {:.4f}s".format(time.time() - t0))
+        if self.use_gradcam:
+            # Grad-CAM用に勾配を有効化
+            with torch.set_grad_enabled(True):
+                outputs = self.model(img)
+                if self.decoder is not None:
+                    outputs = self.decoder(outputs, dtype=outputs.type())
+                outputs = postprocess(
+                    outputs, self.num_classes, self.confthre,
+                    self.nmsthre, class_agnostic=True
+                )
+                # Grad-CAMを計算するために入力と出力を保存
+                self.last_input = img
+                self.last_outputs = outputs
+        else:
+            with torch.no_grad():
+                t0 = time.time()
+                outputs = self.model(img)
+                if self.decoder is not None:
+                    outputs = self.decoder(outputs, dtype=outputs.type())
+                outputs = postprocess(
+                    outputs, self.num_classes, self.confthre,
+                    self.nmsthre, class_agnostic=True
+                )
+                logger.info("Infer time: {:.4f}s".format(time.time() - t0))
+        
         return outputs, img_info
 
+    # 複数オブジェクトへのGrad-CAM適用（バウンディングボックス毎に個別画像を生成）
     def visual(self, output, img_info, cls_conf=0.35):
         ratio = img_info["ratio"]
         img = img_info["raw_img"]
+        
         if output is None:
             return img
+            
         output = output.cpu()
-
         bboxes = output[:, 0:4]
-
-        # preprocessing: resize
         bboxes /= ratio
-
         cls = output[:, 6]
         scores = output[:, 4] * output[:, 5]
-
+        
+        # 通常の可視化（全検出結果を含む）
         vis_res = vis(img, bboxes, scores, cls, cls_conf, self.cls_names)
-        return vis_res
+        
+        # Grad-CAM可視化用の結果リスト
+        gradcam_images = []
+        
+        # Grad-CAM可視化（各オブジェクトに個別に適用）
+        if self.use_gradcam and len(scores) > 0 and self.gradcam is not None:
+            # スコア順にソート
+            sorted_indices = torch.argsort(scores, descending=True)
+            
+            # スコアが閾値以上のオブジェクトを処理
+            valid_indices = [idx for idx in sorted_indices if scores[idx] >= cls_conf]
+            
+            for i, idx in enumerate(valid_indices):
+                class_idx = int(cls[idx].item())
+                bbox = bboxes[idx].tolist()
+                score = scores[idx].item()
+
+                # 元画像のコピーを作成（個別の結果表示用）
+                individual_img = img.copy()
+                
+                # このオブジェクトだけの通常検出結果を描画
+                bbox_tensor = bboxes[idx:idx+1]  # 1つのボックスだけを含むテンソル
+                score_tensor = scores[idx:idx+1]  # 1つのスコアだけを含むテンソル
+                cls_tensor = cls[idx:idx+1]  # 1つのクラスだけを含むテンソル
+                
+                # 個別のオブジェクト検出結果を描画
+                individual_img = vis(individual_img, bbox_tensor, score_tensor, cls_tensor, 0, self.cls_names)
+                
+                # Grad-CAMの計算
+                img_info["test_size"] = self.test_size
+                cam = self.gradcam(self.last_input, class_idx=class_idx, box_idx=idx, img_info=img_info)
+                
+                if cam is not None:
+                    # この特定のオブジェクトだけにGrad-CAMを適用
+                    gradcam_img = apply_gradcam(individual_img, cam, bbox, img_info)
+                    
+                    # # 画像に追加情報を表示
+                    class_name = self.cls_names[class_idx]
+                    # label_text = f"Class: {class_name}, Score: {score:.2f}"
+                    # cv2.putText(
+                    #     gradcam_img,
+                    #     label_text,
+                    #     (10, 30),  # 左上に表示
+                    #     cv2.FONT_HERSHEY_SIMPLEX,
+                    #     0.8,
+                    #     (0, 255, 0),
+                    #     2
+                    # )
+                    
+                    # 結果を保存
+                    gradcam_images.append({
+                        "image": gradcam_img,
+                        "class_id": class_idx,
+                        "class_name": class_name,
+                        "score": score,
+                        "bbox": bbox
+                    })
+        
+        # 全体の検出結果と各オブジェクト個別のGrad-CAM結果を返す
+        return {"full_image": vis_res, "gradcam_images": gradcam_images}
 
 
 def image_demo(predictor, vis_folder, path, current_time, save_result):
@@ -192,18 +294,40 @@ def image_demo(predictor, vis_folder, path, current_time, save_result):
     files.sort()
     for image_name in files:
         outputs, img_info = predictor.inference(image_name)
-        result_image = predictor.visual(outputs[0], img_info, predictor.confthre)
+        result = predictor.visual(outputs[0], img_info, predictor.confthre)
+        
+        # 全体の検出結果画像
+        full_image = result["full_image"]
+        
+        # 各オブジェクト個別のGrad-CAM画像
+        gradcam_images = result.get("gradcam_images", [])
+        
         if save_result:
-            save_folder = os.path.join(
-                vis_folder, time.strftime("%Y_%m_%d_%H_%M_%S", current_time)
-            )
+            # 保存用フォルダ作成
+            timestamp = time.strftime("%Y_%m_%d_%H_%M_%S", current_time)
+            base_name = os.path.basename(image_name).split(".")[0]
+            
+            save_folder = os.path.join(vis_folder, f"{timestamp}_{base_name}")
             os.makedirs(save_folder, exist_ok=True)
-            save_file_name = os.path.join(save_folder, os.path.basename(image_name))
-            logger.info("Saving detection result in {}".format(save_file_name))
-            cv2.imwrite(save_file_name, result_image)
-        ch = cv2.waitKey(0)
-        if ch == 27 or ch == ord("q") or ch == ord("Q"):
-            break
+            
+            # 全体の検出結果画像を保存
+            full_image_path = os.path.join(save_folder, f"{base_name}_full.jpg")
+            cv2.imwrite(full_image_path, full_image)
+            logger.info(f"保存: {full_image_path}")
+            
+            # 各オブジェクト個別のGrad-CAM画像を保存
+            for i, item in enumerate(gradcam_images):
+                obj_image = item["image"]
+                class_name = item["class_name"]
+                score = item["score"]
+                
+                # クラス名とスコアを含むファイル名で保存
+                obj_image_path = os.path.join(
+                    save_folder, 
+                    f"{base_name}_{i}_{class_name}_{score:.2f}.jpg"
+                )
+                cv2.imwrite(obj_image_path, obj_image)
+                logger.info(f"保存: {obj_image_path}")
 
 
 def imageflow_demo(predictor, vis_folder, current_time, args):
@@ -266,6 +390,8 @@ def main(exp, args):
         exp.test_size = (args.tsize, args.tsize)
 
     model = exp.get_model()
+    summary(model, (1, 3, 416, 416), device=args.device)
+    print([name for name, _ in model.named_modules()])
     logger.info("Model Summary: {}".format(get_model_info(model, exp.test_size)))
 
     if args.device == "gpu":
@@ -305,6 +431,7 @@ def main(exp, args):
     predictor = Predictor(
         model, exp, COCO_CLASSES, trt_file, decoder,
         args.device, args.fp16, args.legacy,
+        use_gradcam=args.gradcam, target_layer=args.target_layer
     )
     current_time = time.localtime()
     if args.demo == "image":
